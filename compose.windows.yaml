@@ -1,0 +1,33 @@
+# Запуск через Docker Desktop с Ollama, работающей на Windows.
+x-host-ollama: &host-ollama
+  OLLAMA_BASE_URL: "${NEWS_HOST_OLLAMA_URL:-http://host.docker.internal:11434}"
+  OLLAMA_MODEL: "${NEWS_OLLAMA_MODEL:-qwen2.5:1.5b}"
+
+services:
+  ollama:
+    profiles: [container-ollama]
+  ollama-init:
+    profiles: [container-ollama]
+  app:
+    environment: *host-ollama
+    depends_on: !override
+      init: {condition: service_completed_successfully}
+      ollama-host-check: {condition: service_completed_successfully}
+  worker:
+    environment: *host-ollama
+  beat:
+    environment: *host-ollama
+  ollama-host-check:
+    image: news-summarizer-public:local
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+    environment: *host-ollama
+    command:
+      - python
+      - -c
+      - >-
+        import json, os, urllib.request;
+        request = urllib.request.Request(os.environ['OLLAMA_BASE_URL'].rstrip('/') + '/api/show',
+        data=json.dumps({'model': os.environ['OLLAMA_MODEL']}).encode(), headers={'Content-Type': 'application/json'});
+        urllib.request.urlopen(request, timeout=10).close()

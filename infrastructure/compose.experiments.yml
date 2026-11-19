@@ -1,0 +1,35 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-experiments:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  worker:
+    build:
+      context: ..
+      dockerfile: infrastructure/Dockerfile.experiments
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      DATABASE_URL: "${WORKER_DATABASE_URL:-sqlite+aiosqlite:////app/data/experiments.sqlite3}"
+      OLLAMA_BASE_URL: "${WORKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+      QDRANT_MODE: "${QDRANT_MODE:-local}"
+      QDRANT_URL: "${WORKER_QDRANT_URL:-http://host.docker.internal:6333}"
+      HF_HUB_OFFLINE: "1"
+      EMBEDDING_LOCAL_FILES_ONLY: "true"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    volumes:
+      - ../data:/app/data
+      - ../.cache:/app/.cache
+volumes:
+  redis-experiments:

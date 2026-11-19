@@ -1,0 +1,158 @@
+name: news-summarizer-public
+
+x-python: &python
+  image: news-summarizer-public:local
+  build:
+    context: .
+    dockerfile: infrastructure/Dockerfile
+  environment: &settings
+    APP_HOST: 0.0.0.0
+    DATABASE_URL: "postgresql+asyncpg://news:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/news"
+    JWT_SECRET_KEY: "${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}"
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/1
+    QDRANT_MODE: server
+    QDRANT_URL: http://qdrant:6333
+    OLLAMA_BASE_URL: http://ollama:11434
+    OLLAMA_MODEL: qwen2.5:1.5b
+    RAG_INDEX_DIR: /rag
+    HOLDOUT_PATH: /corpus/test/news_test.json
+    COMPARISON_ARCHIVE_PATH: /corpus/indexes/experiments/stage13-1-comparison.json
+    LOG_DIR: /logs
+    BASELINE_CACHE_TTL_SECONDS: "${BASELINE_CACHE_TTL_SECONDS:-900}"
+    OMP_NUM_THREADS: "${NEWS_CPU_THREADS:-4}"
+    MKL_NUM_THREADS: "${NEWS_CPU_THREADS:-4}"
+  volumes:
+    - ./data:/corpus:ro
+    - rag:/rag
+    - model-cache:/app/.cache
+    - app-logs:/logs
+
+services:
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: news
+      POSTGRES_USER: news
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}"
+    volumes: ["postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "news", "-d", "news"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  qdrant:
+    image: qdrant/qdrant:v1.16.2
+    volumes: ["qdrant:/qdrant/storage"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/6333;
+          printf "GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3;
+          read -r status <&3; [[ "$$status" == *" 200 "* ]]'
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  ollama:
+    image: ollama/ollama:0.13.5
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes: ["ollama:/root/.ollama"]
+    healthcheck:
+      test: ["CMD-SHELL", "OLLAMA_HOST=127.0.0.1:11434 ollama list >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  ollama-init:
+    image: ollama/ollama:0.13.5
+    environment:
+      OLLAMA_HOST: ollama:11434
+    command: ["pull", "qwen2.5:1.5b"]
+    depends_on:
+      ollama: {condition: service_healthy}
+  init:
+    <<: *python
+    command: ["python", "-m", "scripts.prepare_deployment"]
+    depends_on:
+      db: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+  app:
+    <<: *python
+    depends_on:
+      init: {condition: service_completed_successfully}
+      ollama-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  streamlit:
+    image: news-summarizer-public:local
+    build:
+      context: .
+      dockerfile: infrastructure/Dockerfile
+    environment:
+      NEWS_API_URL: http://app:8000
+    command: ["python", "-m", "streamlit", "run", "streamlit_app/app.py", "--server.address=0.0.0.0", "--server.headless=true"]
+    depends_on:
+      app: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  worker:
+    <<: *python
+    command: ["celery", "-A", "backend.worker.celery_app:app", "worker", "--pool=prefork", "--concurrency=1", "--hostname=worker@%h", "--loglevel=INFO"]
+    depends_on:
+      app: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.worker.celery_app:app inspect ping -d worker@$$HOSTNAME -t 3"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    stop_grace_period: 2m
+  beat:
+    <<: *python
+    command: ["celery", "-A", "backend.worker.celery_app:app", "beat", "--pidfile=/tmp/celerybeat.pid", "--schedule=/tmp/celerybeat-schedule", "--loglevel=INFO"]
+    depends_on:
+      redis: {condition: service_healthy}
+      app: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; from pathlib import Path; os.kill(int(Path('/tmp/celerybeat.pid').read_text()), 0)"]
+      interval: 15s
+      timeout: 4s
+      retries: 6
+  nginx:
+    image: nginx:1.28-alpine
+    ports:
+      - "127.0.0.1:${NEWS_PROXY_PORT:-8080}:8080"
+    volumes: ["./infrastructure/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on:
+      app: {condition: service_healthy}
+      streamlit: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/proxy-health"]
+      interval: 10s
+      timeout: 4s
+      retries: 8
+
+volumes:
+  postgres:
+  redis:
+  qdrant:
+  ollama:
+  rag:
+  model-cache:
+  app-logs:
